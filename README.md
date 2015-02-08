@@ -13,7 +13,7 @@ $ sshsync . --recursive --hostname example.com --destination /my/code/ --pattern
 
 1. [Six](http://pythonhosted.org/six/)
 2. [Watchdog](http://pythonhosted.org/watchdog/)
-3. [HashRing](https://pypi.python.org/pypi/pyhashring/0.1.0)
+3. [HashRing](https://pypi.python.org/pypi/hash_ring)
 
 ## License
 The MIT License (MIT)
