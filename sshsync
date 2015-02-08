@@ -1,0 +1,336 @@
+#!/usr/bin/env python2.7
+#  -*- coding: utf-8 -*-
+
+### Python 2-3 Compat
+from __future__ import division
+from __future__ import absolute_import
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import six
+
+from six import iterkeys
+from six import itervalues
+from six import iteritems
+from six import iterlists
+###
+
+import re
+import os
+import time
+import argparse
+import subprocess
+import logging
+import watchdog.events
+import hash_ring
+
+from os import path
+from multiprocessing import Process, Queue
+from watchdog.observers import Observer
+
+# ======
+#  Init
+# ======
+
+logging.basicConfig()
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+
+# =========
+#  Classes
+# =========
+
+class EventHandler(watchdog.events.FileSystemEventHandler):
+    def __init__(self, ring):
+        self.ring = ring
+
+    def _put_queue(self, mtype, event):
+        src = event.src_path
+        q = self.ring.get_node(src)
+
+        q.put({
+            'mtype': mtype,
+            'event': event
+        })
+
+
+    def on_created(self, event):
+        self._put_queue('on_created', event)
+
+
+    def on_modified(self, event):
+        self._put_queue('on_modified', event)
+
+
+    def on_deleted(self, event):
+        self._put_queue('on_deleted', event)
+
+
+    def on_moved(self, event):
+        self._put_queue('on_moved', event)
+
+
+class Consumer():
+    def __init__(self, i, q, args):
+        self.i = i
+        self.q = q
+        self.args = args
+        self.logger = LOGGER
+
+
+    def _norm_path(self, spath):
+        spath = path.normpath(spath)
+        spath_list = spath.split(os.sep)
+
+        spath = self.args.sep.join(spath_list)
+
+        return spath
+
+
+    def _calc_dest(self, src_path):
+        src_path = self._norm_path(src_path)
+        args_path = self._norm_path(self.args.path)
+        dangling = src_path.replace(args_path, '')
+        dest = self.args.destination
+
+        if len(dangling) > 0:
+            if dangling[0] == self.args.sep:
+                dangling = dangling[1:]
+
+            if dest[-1] == self.args.sep:
+                dest = dest[0:-1]
+
+            result = self.args.sep.join([dest, dangling])
+
+            return result
+        else:
+            return None
+
+
+    def _run(self, command, dst_path):
+        retcode = 0
+        self.logger.info("(%d) Running %s %s..." % (self.i, command, dst_path))
+
+        if self.args.dry_run is False:
+            retcode = os.system("ssh %s \"%s %s\"" % (self.args.hostname, command, dst_path))
+
+        if retcode == 0:
+            os.system('beep')
+
+        return retcode
+
+
+    def _put(self, src_path, dst_path):
+        retcode = 0
+        self.logger.info("(%d) Copying %s to %s..." % (self.i, src_path, dst_path))
+
+        if self.args.dry_run is False:
+            os.system("scp %s %s:%s" % (src_path, self.args.hostname, dst_path))
+
+        if retcode == 0:
+            os.system('beep')
+
+        return retcode
+
+
+    def _validate_path(self, src):
+        valid = False
+
+        if len(self.args.patterns) == 0:
+            return True
+
+        for patt in self.args.patterns:
+            if re.match("%s$" % patt, src):
+                valid = True
+                break
+
+        return valid
+
+
+    def directory_process(self, mtype, event):
+        retcode = 0
+        src_path = event.src_path
+        dst_path = self._calc_dest(src_path)
+
+        if dst_path is None:
+            return retcode
+
+        if mtype == "on_created":
+            retcode = self._run("mkdir -p", dst_path)
+        elif mtype == "on_deleted":
+            retcode = self._run("rmdir", dst_path)
+
+        return retcode
+
+
+    def file_process(self, mtype, event):
+        retcode = 0
+        is_valid = self._validate_path(event.src_path)
+
+        if is_valid is False:
+            return
+
+        src_path = event.src_path
+        dst_path = self._calc_dest(src_path)
+
+        if dst_path is None:
+            return
+
+        if mtype == "on_deleted":
+            retcode = self._run("rm", dst_path)
+        elif mtype == "on_created":
+            retcode = self._put(src_path, dst_path)
+        elif mtype == "on_modified":
+            retcode = self._put(src_path, dst_path)
+
+        return retcode
+
+
+    def process(self):
+        while True:
+            try:
+                work = self.q.get()
+
+                if work == "quit":
+                    break
+
+                event = work['event']
+                mtype = work['mtype']
+
+                if event.is_directory:
+                    retcode = self.directory_process(mtype, event)
+
+                    if retcode != 0:
+                        self.q.put({
+                            'event': event,
+                            'mtype': mtype
+                        })
+                else:
+                    self.file_process(mtype, event)
+            except KeyboardInterrupt:
+                break
+
+# ===========
+#  Functions
+# ===========
+
+
+def start_consumers(args):
+    consumers = []
+    consumers_p = []
+
+    LOGGER.info('Starting consumers...')
+
+    for i in range(0, args.nproc):
+        LOGGER.info('Starting consumer %d...' % (i+1))
+
+        q = Queue()
+        c = Consumer(i, q, args)
+        p = Process(target=c.process)
+        p.start()
+
+        consumers.append(q)
+        consumers_p.append(p)
+
+    return (consumers, consumers_p)
+
+
+def stop_consumers(consumers, consumers_p):
+    for q in consumers:
+        q.put('quit')
+
+    for consumer in consumers_p:
+        try:
+            consumer.join()
+        except AssertionError:
+            pass
+
+
+def watch(args, consumers, consumers_p):
+    observer = Observer()
+    ring = hash_ring.HashRing(consumers)
+    
+    observer.schedule(EventHandler(ring), args.path, args.recursive)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_consumers(consumers, consumers_p)
+        observer.stop()
+
+    observer.join()
+
+
+# ==================
+#  Argument Parsing
+# ==================
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "path",
+    help="Directory to watch for changes"
+)
+
+parser.add_argument(
+    "--dry_run",
+    help="Indicate possible actions",
+    default=False,
+    action='store_true'
+)
+
+parser.add_argument(
+    "--recursive",
+    help="Recursively watch directory",
+    default=False,
+    action='store_true'
+)
+
+parser.add_argument(
+    "--hostname",
+    help="Hostname of server defined in SSH config",
+    action='store',
+    required=True
+)
+
+parser.add_argument(
+    "--destination",
+    help="Location on remote server",
+    action='store',
+    required=True
+)
+
+parser.add_argument(
+    "--patterns",
+    help="Trigger only for these patterns",
+    default=[],
+    nargs='+',
+    type=str
+)
+
+parser.add_argument(
+    "--nproc",
+    help="Number of simultaneous transfers (Default: 5)",
+    action='store',
+    type=int,
+    default=5
+)
+
+parser.add_argument(
+    "--sep",
+    help="Path seperator in destination (Default: /)",
+    action="store",
+    default='/'
+)
+
+# ======
+#  Main
+# ======
+
+args = parser.parse_args()
+args.path = path.normpath(path.abspath(args.path))
+
+(consumers, consumers_p) = start_consumers(args)
+watch(args, consumers, consumers_p)
