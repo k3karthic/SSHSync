@@ -22,11 +22,12 @@ import argparse
 import subprocess
 import logging
 import watchdog.events
+import threading
+import Queue
 
 from os import path
-from multiprocessing import Process, Queue
 from watchdog.observers import Observer
-from pyhashring import HashRing
+from hash_ring import HashRing
 
 # ======
 #  Init
@@ -47,7 +48,7 @@ class EventHandler(watchdog.events.FileSystemEventHandler):
 
     def _put_queue(self, mtype, event):
         src = event.src_path
-        qidx = self.ring.find(src)
+        qidx = self.ring.get_node(src)
         q = self.consumers[int(qidx)]
 
         q.put({
@@ -228,10 +229,14 @@ class Consumer():
 
 
 def create_ring(consumers):
-    ring = HashRing()
-
+    consumersList = []
+    consumersWeight = {}
+    
     for (idx, _) in enumerate(consumers):
-        ring.add(str(idx))
+        consumersList.append(str(idx))
+        consumersWeight[str(idx)] = 1
+
+    ring = HashRing(consumersList, consumersWeight)
 
     return ring
 
@@ -246,13 +251,13 @@ def start_consumers(args):
     for i in range(0, args.nproc):
         logger.info('Starting consumer %d...' % (i+1))
 
-        q = Queue()
+        q = Queue.Queue()
         c = Consumer(i, q, args)
-        p = Process(target=c.process)
-        p.start()
+        t = threading.Thread(target=c.process)
+        t.start()
 
         consumers.append(q)
-        consumers_p.append(p)
+        consumers_p.append(t)
 
     return (consumers, consumers_p)
 
